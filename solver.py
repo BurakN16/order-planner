@@ -6,9 +6,18 @@ def palet_factor(pal_type):
 def calculate_effective_pallet(row):
     return row['CPallet'] * palet_factor(row['PALTypeChoice'])
 
+def get_truck_limit(truck_type):
+    """Truck_Type sütununa göre araç palet limiti belirle"""
+    if pd.isna(truck_type):
+        return 33
+    t = truck_type.lower()
+    if "liftli" in t:
+        return 8
+    elif "kamyon" in t and "tır" not in t:
+        return 18
+    return 33  # Tır veya varsayılan
+
 def split_large_orders(city_group, truck_counter_start=1):
-    """33 paleti geçen büyük siparişleri böl ve 33 paletlik parçaları ata,
-    kalanları da liste olarak döndür."""
     assignments = []
     leftover_parts = []
     truck_counter = truck_counter_start
@@ -16,21 +25,21 @@ def split_large_orders(city_group, truck_counter_start=1):
     shipto_groups = city_group.groupby('Ship to')
 
     for ship_to, sub_group in shipto_groups:
+        truck_type = sub_group['Truck_Type'].iloc[0] if 'Truck_Type' in sub_group.columns else None
+        limit = get_truck_limit(truck_type)
+
         total_pallet = sub_group['EffectivePallet'].sum()
-        if total_pallet <= 33:
-            # Küçük siparişler burada değil, sonraya bırakacağız
+        if total_pallet <= limit:
             leftover_parts.append((ship_to, sub_group))
             continue
 
-        # Büyük siparişleri böl
         rows = sub_group.to_dict('records')
         part = []
         part_load = 0
 
         for row in rows:
             p = row['EffectivePallet']
-            if part_load + p > 33:
-                # 33 paleti geçen parça tamamlanınca ata
+            if part_load + p > limit:
                 df_part = pd.DataFrame(part)
                 for r in df_part.to_dict('records'):
                     r['Assigned_Truck'] = f"Truck-{truck_counter}"
@@ -41,7 +50,6 @@ def split_large_orders(city_group, truck_counter_start=1):
             part.append(row)
             part_load += p
 
-        # Kalan parçayı atama listesine ekle
         if part:
             df_part = pd.DataFrame(part)
             leftover_parts.append((ship_to, df_part))
@@ -49,21 +57,14 @@ def split_large_orders(city_group, truck_counter_start=1):
     return assignments, leftover_parts, truck_counter
 
 def group_and_assign_leftovers(leftover_parts, truck_counter_start=1):
-    """Kalan parçaları şehir bazında grupla, 33 palet ve 4 shipto kısıtları ile araçlara ata."""
     assignments = []
     truck_counter = truck_counter_start
 
-    # leftover_parts: list of (ship_to, DataFrame)
-    # Önce ship_to bazında grupla ve tüm DataFrame'leri birleştir
     combined_df = pd.concat([df for _, df in leftover_parts], ignore_index=True)
-
-    # Şehir bazında grupla
     grouped_city = combined_df.groupby('Ship to City')
 
     for city, city_group in grouped_city:
         city_group = city_group.reset_index(drop=True)
-
-        # Ship to bazında grupla
         subgroups = city_group.groupby('Ship to')
 
         pending_groups = []
@@ -71,7 +72,6 @@ def group_and_assign_leftovers(leftover_parts, truck_counter_start=1):
             total_pallet = sub_group['EffectivePallet'].sum()
             pending_groups.append((ship_to, sub_group, total_pallet))
 
-        # Palet sayısına göre azalan sırala
         pending_groups.sort(key=lambda x: x[2], reverse=True)
 
         while pending_groups:
@@ -85,18 +85,18 @@ def group_and_assign_leftovers(leftover_parts, truck_counter_start=1):
                     return sub_group['EffectivePallet'].sum()
                 else:
                     def pallet_factor_override(row):
-                        if row['PALTypeChoice'] == 'Kısa Hafif':
-                            return row['CPallet'] * 1
-                        else:
-                            return row['CPallet'] * 1
+                        return row['CPallet'] * 1  # KH'ler de KA gibi sayılır
                     return sub_group.apply(pallet_factor_override, axis=1).sum()
 
             for ship_to, sub_group, total_pallet in pending_groups:
                 multiple_shipto_in_truck = len(used_shiptos | {ship_to}) > 1
                 adjusted_pallet = calc_adjusted_pallet(sub_group, multiple_shipto_in_truck)
 
-                if adjusted_pallet <= 33:
-                    if (current_load + adjusted_pallet <= 33) and (len(used_shiptos | {ship_to}) <= 4):
+                truck_type = sub_group['Truck_Type'].iloc[0] if 'Truck_Type' in sub_group.columns else None
+                limit = get_truck_limit(truck_type)
+
+                if adjusted_pallet <= limit:
+                    if (current_load + adjusted_pallet <= limit) and (len(used_shiptos | {ship_to}) <= 4):
                         current_load += adjusted_pallet
                         truck_orders.append((ship_to, sub_group))
                         used_shiptos.add(ship_to)
@@ -138,44 +138,27 @@ def solve_assignment(order_df):
     grouped_city = order_df.groupby('Ship to City')
 
     for city, city_group in grouped_city:
-        # 1. Büyük siparişleri böl ve 33 paletlik parçaları ata
         assigned_large, leftover_parts, truck_counter = split_large_orders(city_group, truck_counter)
-
         assignments.extend(assigned_large)
 
-        # 2. Kalan parçalarla şehir bazında gruplayarak araçlara ata
         assigned_leftovers, truck_counter = group_and_assign_leftovers(leftover_parts, truck_counter)
         assignments.extend(assigned_leftovers)
 
-    # assignments listesini DataFrame'e çevir
     assigned_df = pd.DataFrame(assignments)
 
-    # Burada Assigned_Truck bazında araç isimlerini güncelleyelim
     def update_truck_name(truck_id, df):
-        # Araçta Temp_Type sütununda 'Temp' geçen var mı kontrolü
         has_temp = df['Temp_Type'].astype(str).str.contains('Temp').any()
-
         truck_type = "Frigo" if has_temp else "Tente"
-
         total_pallet = df['EffectivePallet'].sum()
         vehicle_type = "Kamyon" if total_pallet <= 18 else "Tır"
-
         return f"{truck_type} {vehicle_type} -{truck_id}"
 
-    # Assigned_Truck sütunundaki değerlerden sadece sayıyı alalım (örneğin 'Truck-3' -> 3)
     assigned_df['Truck_Number'] = assigned_df['Assigned_Truck'].str.extract(r'(\d+)').astype(int)
-
-    # Araç bazında yeni isimler oluştur
     truck_names = {}
     for truck_num, group in assigned_df.groupby('Truck_Number'):
         truck_names[truck_num] = update_truck_name(truck_num, group)
-
-    # Yeni isimleri Assigned_Truck sütununa yaz
     assigned_df['Assigned_Truck'] = assigned_df['Truck_Number'].map(truck_names)
-
-    # Yardımcı sütunu kaldıralım
     assigned_df = assigned_df.drop(columns=['Truck_Number'])
 
     print(f"\n✅ Toplam atanan kayıt: {len(assigned_df)}")
     return assigned_df
-
