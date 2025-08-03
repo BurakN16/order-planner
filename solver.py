@@ -1,13 +1,12 @@
 import pandas as pd
 
 def palet_factor(pal_type):
-    return 0.5 if pal_type == 'Kısa Hafif' else 1
+    return 1  # Kısa Hafif artık 0.5 değil 1 sayılıyor
 
 def calculate_effective_pallet(row):
     return row['CPallet'] * palet_factor(row['PALTypeChoice'])
 
 def get_truck_limit(truck_type):
-    """Truck_Type sütununa göre araç palet limiti belirle"""
     if pd.isna(truck_type):
         return 33
     t = truck_type.lower()
@@ -15,7 +14,47 @@ def get_truck_limit(truck_type):
         return 8
     elif "kamyon" in t and "tır" not in t:
         return 18
-    return 33  # Tır veya varsayılan
+    return 33
+
+def split_sales_document_rows(df, limit, truck_counter_start):
+    """33 paleti geçen satış belgesini satır bazında bölerek atama yapar.
+    Satırları büyükten küçüğe sıralar, kamyonu mümkün olduğunca dolu tutmaya çalışır."""
+    assignments = []
+    truck_counter = truck_counter_start
+
+    # Satırları EffectivePallet'e göre büyükten küçüğe sırala
+    rows = df.to_dict('records')
+    rows.sort(key=lambda x: x['EffectivePallet'], reverse=True)
+
+    current_part = []
+    current_load = 0
+
+    for row in rows:
+        p = row['EffectivePallet']
+
+        # Eğer satırı eklemek 33'ü aşarsa, önce mevcut kamyonu atayıp yenisine başla
+        if current_load + p > limit:
+            # Öncelikle mevcut partı at
+            if current_part:
+                for r in current_part:
+                    r['Assigned_Truck'] = f"Truck-{truck_counter}"
+                    assignments.append(r)
+                truck_counter += 1
+                current_part = []
+                current_load = 0
+
+        # Satırı yeni partiye ekle
+        current_part.append(row)
+        current_load += p
+
+    # Son part varsa ata
+    if current_part:
+        for r in current_part:
+            r['Assigned_Truck'] = f"Truck-{truck_counter}"
+            assignments.append(r)
+        truck_counter += 1
+
+    return assignments, truck_counter
 
 def split_large_orders(city_group, truck_counter_start=1):
     assignments = []
@@ -33,26 +72,47 @@ def split_large_orders(city_group, truck_counter_start=1):
             leftover_parts.append((ship_to, sub_group))
             continue
 
-        rows = sub_group.to_dict('records')
-        part = []
-        part_load = 0
+        sales_groups = list(sub_group.groupby('Sales Document', dropna=False))
 
-        for row in rows:
-            p = row['EffectivePallet']
-            if part_load + p > limit:
-                df_part = pd.DataFrame(part)
-                for r in df_part.to_dict('records'):
-                    r['Assigned_Truck'] = f"Truck-{truck_counter}"
-                    assignments.append(r)
-                truck_counter += 1
-                part = []
-                part_load = 0
-            part.append(row)
-            part_load += p
+        sales_docs = []
+        for sd, df in sales_groups:
+            total_sd_pallet = df['EffectivePallet'].sum()
+            sales_docs.append((sd, df, total_sd_pallet))
 
-        if part:
-            df_part = pd.DataFrame(part)
-            leftover_parts.append((ship_to, df_part))
+        sales_docs.sort(key=lambda x: x[2], reverse=True)
+
+        current_truck_load = 0
+        current_truck_docs = []
+
+        def flush_current_truck():
+            nonlocal truck_counter, current_truck_docs, current_truck_load
+            if not current_truck_docs:
+                return
+            combined_df = pd.concat([df for _, df, _ in current_truck_docs], ignore_index=True)
+            for _, row in combined_df.iterrows():
+                order = row.to_dict()
+                order['Assigned_Truck'] = f"Truck-{truck_counter}"
+                assignments.append(order)
+            truck_counter += 1
+            current_truck_docs = []
+            current_truck_load = 0
+
+        for sd, df, sd_total in sales_docs:
+            if sd_total > limit:
+                # 33 paleti geçen sales document için satır bazında bölme uygula
+                part_assignments, truck_counter = split_sales_document_rows(df, limit, truck_counter)
+                assignments.extend(part_assignments)
+                continue
+
+            if current_truck_load + sd_total <= limit:
+                current_truck_docs.append((sd, df, sd_total))
+                current_truck_load += sd_total
+            else:
+                flush_current_truck()
+                current_truck_docs.append((sd, df, sd_total))
+                current_truck_load = sd_total
+
+        flush_current_truck()
 
     return assignments, leftover_parts, truck_counter
 
@@ -60,7 +120,14 @@ def group_and_assign_leftovers(leftover_parts, truck_counter_start=1):
     assignments = []
     truck_counter = truck_counter_start
 
-    combined_df = pd.concat([df for _, df in leftover_parts], ignore_index=True)
+    if not leftover_parts:
+        return assignments, truck_counter
+
+    dfs = [df for _, df in leftover_parts if isinstance(df, pd.DataFrame)]
+    if not dfs:
+        return assignments, truck_counter
+
+    combined_df = pd.concat(dfs, ignore_index=True)
     grouped_city = combined_df.groupby('Ship to City')
 
     for city, city_group in grouped_city:
@@ -85,7 +152,7 @@ def group_and_assign_leftovers(leftover_parts, truck_counter_start=1):
                     return sub_group['EffectivePallet'].sum()
                 else:
                     def pallet_factor_override(row):
-                        return row['CPallet'] * 1  # KH'ler de KA gibi sayılır
+                        return row['CPallet'] * 1
                     return sub_group.apply(pallet_factor_override, axis=1).sum()
 
             for ship_to, sub_group, total_pallet in pending_groups:
