@@ -157,7 +157,7 @@ def group_and_assign_leftovers(leftover_parts, truck_counter_start=1):
                 limit = get_truck_limit(truck_type)
 
                 if adjusted_pallet <= limit:
-                    if (current_load + adjusted_pallet <= limit) and (len(used_shiptos | {ship_to}) <= 4):
+                    if (current_load + adjusted_pallet <= limit) and (len(used_shiptos | {ship_to}) <= 3):
                         current_load += adjusted_pallet
                         truck_orders.append((ship_to, sub_group))
                         used_shiptos.add(ship_to)
